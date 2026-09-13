@@ -205,16 +205,20 @@ class SseClient(McpClient):
                     )
                 except Exception as e:
                     logger.debug("[SseClient] sse_client generator __aexit__ raised %r (ignored)", e)
-            self._session = None
-            self._client = None
-            self._read = None
-            self._write = None
-            self._is_disconnected = True
             logger.info("[SseClient] SSE client disconnected successfully")
             return True
         except Exception as e:
             logger.error("[SseClient] SSE disconnection failed: %s: %r", type(e).__name__, e)
             return False
+        finally:
+            # aclose/__aexit__ 失败也必须清掉半死会话，否则下次 call_tool 复用坏连接。
+            self._session = None
+            self._client = None
+            self._read = None
+            self._write = None
+            self._is_disconnected = True
+            self._exit_stack = AsyncExitStack()
+            self._auth_provider = None
 
     async def _do_reconnect(self, *, timeout: float) -> bool:
         logger.debug("[SseClient] Executing reconnect sequence")

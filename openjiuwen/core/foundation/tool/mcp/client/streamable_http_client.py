@@ -3,6 +3,7 @@
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
+import asyncio
 import httpx
 
 from openjiuwen.core.common.logging import logger
@@ -122,7 +123,7 @@ class StreamableHttpClient(McpClient):
                 logger.error(
                     f"Streamable-http disconnect during connect-failure also failed: {disconnect_exc}"
                 )
-            if isinstance(e, KeyboardInterrupt):
+            if isinstance(e, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
                 raise
             return False
 
@@ -130,16 +131,20 @@ class StreamableHttpClient(McpClient):
         """Close streamable-http connection."""
         try:
             await self._exit_stack.aclose()
-            self._session = None
-            self._client = None
-            self._read = None
-            self._write = None
-            self._is_disconnected = True
             logger.info("Streamable-http client disconnected successfully")
             return True
         except Exception as e:
             logger.error(f"Streamable-http disconnection failed: {e}")
             return False
+        finally:
+            # aclose 失败也必须清掉半死会话，否则下次 call_tool 复用坏连接。
+            self._session = None
+            self._client = None
+            self._read = None
+            self._write = None
+            self._is_disconnected = True
+            self._exit_stack = AsyncExitStack()
+            self._auth_provider = None
 
     async def list_tools(self, *, timeout: float = NO_TIMEOUT) -> List[Any]:
         """List available tools via streamable-http."""

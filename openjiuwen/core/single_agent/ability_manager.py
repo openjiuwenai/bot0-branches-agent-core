@@ -1399,12 +1399,19 @@ class AbilityManager:
             if call_timeout is None:
                 call_timeout = MAX_TOOL_CALL_TIMEOUT_HARD_LIMIT
             try:
-                with anyio.fail_after(call_timeout):
-                    result = await tool.invoke(
+                # MCP streamable-http/SSE：必须用 asyncio.wait_for，不能用
+                # anyio.fail_after。超时后重连的 connect() 若发生在 fail_after
+                # scope 内，退出 scope 会抛 cancel scope（TC_MCP_CALL_014 第 3 轮：
+                # call completed 后仍失败）。wait_for 在子 task 隔离超时，与
+                # mcp_call_timeout_patch / mcp_config remote 策略一致。
+                result = await asyncio.wait_for(
+                    tool.invoke(
                         tool_args,
                         session=session,
                         tool_call_id=tool_call.id,
-                    )
+                    ),
+                    timeout=call_timeout,
+                )
             except TimeoutError as e:
                 error_msg = f"Tool '{tool_name}' timed out after {call_timeout}s"
                 logger.warning(error_msg)
@@ -1508,12 +1515,15 @@ class AbilityManager:
             if call_timeout is None:
                 call_timeout = MAX_TOOL_CALL_TIMEOUT_HARD_LIMIT
             try:
-                with anyio.fail_after(call_timeout):
-                    result = await tool.invoke(
+                # 同主路径：用 wait_for，避免 MCP 重连嵌在 fail_after 内触发 cancel scope。
+                result = await asyncio.wait_for(
+                    tool.invoke(
                         tool_args,
                         session=session,
                         tool_call_id=tool_call.id,
-                    )
+                    ),
+                    timeout=call_timeout,
+                )
             except TimeoutError as e:
                 error_msg = f"Tool '{tool_name}' timed out after {call_timeout}s"
                 logger.warning(error_msg)

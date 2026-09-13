@@ -124,14 +124,20 @@ class ToolMgr:
                 connected = await client.connect()
                 if not connected:
                     raise build_error(
-                        StatusCode.RESOURCE_MCP_SERVER_CONNECTION_ERROR, server_config=server_config, reason=""
+                        StatusCode.RESOURCE_MCP_SERVER_CONNECTION_ERROR,
+                        server_config=server_config,
+                        reason="connect returned False",
                     )
                 results = await self._inner_refresh_mcp_tools(client, server_config, expiry_time)
                 self._mcp_server_name_to_ids.setdefault(server_config.server_name, []).append(server_config.server_id)
                 return results
             except Exception as e:
+                reason = str(e) or repr(e) or type(e).__name__
                 raise build_error(
-                    StatusCode.RESOURCE_MCP_SERVER_ADD_ERROR, cause=e, server_config=server_config, reason=str(e)
+                    StatusCode.RESOURCE_MCP_SERVER_ADD_ERROR,
+                    cause=e,
+                    server_config=server_config,
+                    reason=reason,
                 ) from e
 
     @staticmethod
@@ -226,6 +232,10 @@ class ToolMgr:
     async def _inner_refresh_mcp_tools(self, client, server_config, expiry_time):
         mcp_cards = await client.list_tools()
         mcp_cards = mcp_cards if mcp_cards else []
+        # 刷新前先卸旧工具，避免 add_tool 撞 already exist。
+        old = self._mcp_server_resources.get(server_config.server_id)
+        if old is not None:
+            self._inner_remove_mcp_tools(old.tool_ids)
         for card in mcp_cards:
             card.id = self.generate_mcp_tool_id(server_config.server_id, server_config.server_name, card.name)
             self.add_tool(card.id, MCPTool(mcp_client=client, tool_info=deepcopy(card)))

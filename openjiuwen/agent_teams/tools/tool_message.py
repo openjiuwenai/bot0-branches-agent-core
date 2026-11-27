@@ -133,13 +133,39 @@ class _SendMessageBase(TeamTool, ABC):
         msg_id = await self.message_manager.broadcast_message(content=content)
         if not msg_id:
             return ToolOutput(success=False, error="Failed to broadcast message")
+        # A broadcast row is always written, even when the roster is empty.
+        # Report how many members can actually read it: a bare "Success"
+        # convinced the leader that members existed and would start working.
+        recipient_count = await self._broadcast_recipient_count()
         return ToolOutput(
             success=True,
             data={
                 "type": "broadcast",
                 "from": self.message_manager.member_name,
                 "summary": summary or None,
+                "recipient_count": recipient_count,
             },
+        )
+
+    async def _broadcast_recipient_count(self) -> int | None:
+        """Reachable roster size a broadcast reaches; ``None`` when unreadable.
+
+        Mirrors ``_send``'s "unreachable => not delivered" rule: SHUTDOWN
+        members can never read the row, so they must not inflate the count.
+        """
+        if not self._team:
+            return None
+        try:
+            roster = await self._team.list_member_roster()
+        except Exception as e:  # noqa: BLE001 - informational only
+            team_logger.warning(
+                "[SendMessageTool] broadcast: roster read failed: %s", e
+            )
+            return None
+        return sum(
+            1
+            for member in roster
+            if str(getattr(member, "status", "")) != MemberStatus.SHUTDOWN.value
         )
 
     async def _send(self, to: str, content: str, summary: str) -> ToolOutput:
@@ -307,7 +333,15 @@ class _SendMessageBase(TeamTool, ABC):
                 return self._format_multicast_text(base, d)
             return base
         if d["type"] == "broadcast":
-            return f"Broadcast Already sent from {d['from']} Success"
+            count = d.get("recipient_count")
+            if count is None:
+                return f"Broadcast sent from {d['from']} (recipient count unavailable)"
+            if count == 0:
+                return (
+                    f"Broadcast from {d['from']} was stored but reached 0 members — "
+                    "no teammates are registered, nobody will read it"
+                )
+            return f"Broadcast sent from {d['from']} to {count} member(s)"
         if d["type"] == "multicast":
             return self._format_multicast_text(None, d)
         return f"Message Already sent from {d['from']} to {d['to']} Success"

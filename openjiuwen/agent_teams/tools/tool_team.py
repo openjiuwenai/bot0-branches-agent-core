@@ -3,15 +3,25 @@
 
 """Team lifecycle tools: build_team and clean_team."""
 
+import asyncio
 from typing import Any
 
 from openjiuwen.agent_teams.tools.locales import Translator
-from openjiuwen.agent_teams.tools.team import CapabilityOverrides, TeamBackend
+from openjiuwen.agent_teams.tools.team import (
+    CapabilityOverrides,
+    MemberReconcileReport,
+    TeamBackend,
+)
 from openjiuwen.agent_teams.tools.tool_base import TeamTool
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.logging import team_logger
 from openjiuwen.core.foundation.tool.base import ToolCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
+
+# Half-built recovery: after a build failure whose team row already exists,
+# reconcile the predefined roster before answering. Bounded so a wedged DB
+# cannot hold one tool call open for a full retry cycle per missing member.
+_BUILD_RECONCILE_TIMEOUT_SEC = 30.0
 
 
 # ========== Team Management ==========
@@ -168,10 +178,57 @@ class BuildTeamTool(TeamTool):
                 # 失败出口口径分叉。
                 self.team.reset_build_unknown()
                 await self.team.notify_build_recovered()
+                # 行已落库但成员注册中断：恢复责任
+                # 在运行时。这里幂等补齐缺失的预定义
+                # 成员；补齐成功即团队可用，按成功返回。
+                report, reconcile_detail = await self._reconcile_after_partial_build(
+                    existing
+                )
+                if report is not None and report.complete:
+                    team_logger.warning(
+                        "[BuildTeamTool] build_team: partial failure recovered "
+                        "after reconciling team %s (%d member(s) registered): %s",
+                        self.team.team_name,
+                        len(report.created),
+                        err_text,
+                    )
+                    return ToolOutput(
+                        success=True,
+                        data={
+                            "team_name": self.team.team_name,
+                            "display_name": display_name,
+                            "leader_member_name": self.team.member_name,
+                            "leader_display_name": leader_display_name,
+                            "enable_hitt": self.team.hitt_enabled(),
+                            "enable_task_verification": self.team.task_verification_enabled(),
+                            "recovered_from": err_text,
+                            "reconciled_members": list(report.created),
+                        },
+                    )
+                # 补齐仍不完整（或超时）：结构化失败，且不再推荐当前工具集
+                # 里不存在的恢复动作。团队不可用——禁止建任务/广播，避免
+                # 零成员 pending 僵尸形态。同时置 round-end latch：不完整
+                # 就代表本轮没有可用团队，收尾不得静默按"正常完成"呈现
+                # （与其余失败出口同口径；补齐成功路径已由 recovered 清除）。
                 await self.team.notify_build_failed(err_text)
+                if report is None:
+                    expected: Any = self.team.expected_member_count()
+                    present: Any = "?"
+                    details = reconcile_detail
+                else:
+                    expected = report.expected
+                    present = report.present
+                    details = report.failure_summary() or "unknown"
                 return ToolOutput(
                     success=False,
-                    error=self._t("build_team", "partial_built", reason=err_text),
+                    error=self._t(
+                        "build_team",
+                        "partial_built",
+                        reason=err_text,
+                        expected=expected,
+                        present=present,
+                        details=details,
+                    ),
                 )
             self.team.reset_build_unknown()  # 确定未建成：状态已可判定
             self.team.note_build_failure(err_text)
@@ -192,6 +249,52 @@ class BuildTeamTool(TeamTool):
                 "enable_task_verification": self.team.task_verification_enabled(),
             },
         )
+
+    async def _reconcile_after_partial_build(
+            self,
+            team: Any | None = None,
+    ) -> tuple[MemberReconcileReport | None, str]:
+        """Reconcile the predefined roster after a half-built failure.
+
+        ``team`` is the ``team_info`` row already fetched to classify the
+        half-built state; handing it to the backend avoids a second read on
+        the recovery path.
+
+        Returns ``(report, detail)``. ``report`` is ``None`` when the attempt
+        itself timed out or raised; ``detail`` then carries the localized,
+        cause-specific reason (timeout vs. exception) for the LLM-facing
+        ``partial_built`` text — the two must not be conflated.
+        """
+        try:
+            report = await asyncio.wait_for(
+                self.team.reconcile_predefined_members(team=team),
+                timeout=_BUILD_RECONCILE_TIMEOUT_SEC,
+            )
+            return report, ""
+        except asyncio.TimeoutError:
+            team_logger.warning(
+                "[BuildTeamTool] build_team: reconcile after partial build "
+                "timed out after %ss for team %s",
+                _BUILD_RECONCILE_TIMEOUT_SEC,
+                self.team.team_name,
+            )
+            return None, self._t(
+                "build_team",
+                "reconcile_timeout",
+                seconds=int(_BUILD_RECONCILE_TIMEOUT_SEC),
+            )
+        except Exception as e:  # noqa: BLE001 - surfaced to the LLM below
+            team_logger.warning(
+                "[BuildTeamTool] build_team: reconcile after partial build "
+                "failed for team %s: %s",
+                self.team.team_name,
+                e,
+            )
+            return None, self._t(
+                "build_team",
+                "reconcile_error",
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def map_result(self, output: ToolOutput) -> str:
         if not output.success:
